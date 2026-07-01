@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Search Google Scholar or Libris (libris.kb.se) for books, let the user
-pick a result, and append its BibTeX entry to a .bib file with a normalized
-cite key (firstAuthor + year)."""
+"""Search Google Scholar, Libris (libris.kb.se), or Crossref for publications,
+let the user pick a result, and append its BibTeX entry to a .bib file with a
+normalized cite key (firstAuthor + year)."""
 
 import argparse
 import json
@@ -52,6 +52,11 @@ def fetch_bibtex_scholar(pub):
 
 
 LIBRIS_USER_AGENT = "bibtex_retriever/1.0 (+https://libris.kb.se)"
+
+CROSSREF_API_URL = "https://api.crossref.org/works"
+CROSSREF_DOI_URL = "https://doi.org"
+CROSSREF_REQUEST_TIMEOUT = 30
+CROSSREF_USER_AGENT = "bibtex_retriever/1.0"
 
 
 def _libris_request(url):
@@ -204,6 +209,151 @@ def fetch_bibtex_libris(pub):
     return _build_libris_bibtex(pub)
 
 
+def _crossref_year(item):
+    """Extract the publication year from a Crossref work item.
+
+    Crossref may expose the year under 'published-print', 'published-online',
+    or 'issued'; each carries a 'date-parts' list-of-lists whose first
+    sublist holds [year, month?, day?].
+    """
+    for key in ("published-print", "published-online", "issued"):
+        block = item.get(key) or {}
+        parts = block.get("date-parts") or []
+        if parts and parts[0] and parts[0][0]:
+            return str(parts[0][0])
+    return "?"
+
+
+def _crossref_authors(item):
+    """Build a BibTeX-style 'family, given and family, given ...' author list."""
+    authors = item.get("author") or []
+    names = []
+    for a in authors:
+        family = a.get("family", "")
+        given = a.get("given", "")
+        if family and given:
+            names.append(f"{family}, {given}")
+        elif family:
+            names.append(family)
+        elif given:
+            names.append(given)
+    return " and ".join(names) if names else "(no author)"
+
+
+def fetch_results_crossref(query, limit=SCHOLAR_RESULTS_LIMIT):
+    """Return up to `limit` publication-like dicts from the Crossref REST API.
+
+    Each result is normalized to the ``{"bib": {...}}`` shape used by the rest
+    of the pipeline. A ``"crossref_doi"`` field carries the DOI used later to
+    fetch the BibTeX entry via content negotiation.
+    """
+    params = urllib.parse.urlencode({"query": query, "rows": limit})
+    url = f"{CROSSREF_API_URL}?{params}"
+    req = urllib.request.Request(
+        url, headers={"User-Agent": CROSSREF_USER_AGENT}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=CROSSREF_REQUEST_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        print(f"Error querying Crossref: {exc}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        print(f"Could not parse Crossref response: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    items = data.get("message", {}).get("items", [])
+    if not items:
+        return []
+
+    results = []
+    for item in items:
+        titles = item.get("title") or []
+        title = titles[0] if titles else "(no title)"
+        bib = {
+            "title": title,
+            "author": _crossref_authors(item),
+            "pub_year": _crossref_year(item) or "?",
+            "publisher": item.get("publisher", ""),
+            "type": item.get("type", ""),
+            "doi": item.get("DOI", ""),
+        }
+        results.append({"bib": bib, "crossref_doi": item.get("DOI", "")})
+    return results
+
+
+def _build_crossref_bibtex(pub):
+    """Construct a minimal BibTeX entry from normalized Crossref metadata.
+
+    Used as a fallback when content negotiation cannot produce an entry.
+    Picks '@article' for journal-like types and '@book' otherwise, falling
+    back to '@misc' for anything unrecognized.
+    """
+    bib = pub.get("bib", {})
+    title = bib.get("title", "")
+    author = bib.get("author", "")
+    year = bib.get("pub_year", "")
+    publisher = bib.get("publisher", "")
+    doi = bib.get("doi", "")
+    wtype = (bib.get("type") or "").lower()
+
+    if "journal" in wtype or "article" in wtype:
+        entry_type = "article"
+    elif "book" in wtype:
+        entry_type = "book"
+    else:
+        entry_type = "misc"
+
+    lines = [f"@{entry_type}{{crossrefplaceholder,"]
+    if author:
+        lines.append(f"\tauthor = {{{author}}},")
+    if title:
+        lines.append(f"\ttitle = {{{title}}},")
+    if year:
+        lines.append(f"\tyear = {{{year}}},")
+    if publisher:
+        lines.append(f"\tpublisher = {{{publisher}}},")
+    if doi:
+        lines.append(f"\tdoi = {{{doi}}},")
+    if lines[-1].endswith(","):
+        lines[-1] = lines[-1][:-1]
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def fetch_bibtex_crossref(pub):
+    """Return the raw BibTeX string for a Crossref record, or None.
+
+    Tries content negotiation against doi.org with an
+    ``Accept: application/x-bibtex`` header; on failure falls back to
+    building an entry from the search-result metadata so the user is
+    never left empty.
+    """
+    doi = pub.get("crossref_doi", "")
+    if doi:
+        url = f"{CROSSREF_DOI_URL}/{urllib.parse.quote(doi, safe='')}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": CROSSREF_USER_AGENT,
+                "Accept": "application/x-bibtex",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=CROSSREF_REQUEST_TIMEOUT) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            print(
+                f"Crossref content negotiation unavailable for {doi}: {exc}",
+                file=sys.stderr,
+            )
+    print("Falling back to building a BibTeX entry from Crossref metadata.",
+          file=sys.stderr)
+    return _build_crossref_bibtex(pub)
+
+
 def display_menu(results, provider_label):
     """Print the numbered menu of search results."""
     print(f"\n{provider_label} results:\n")
@@ -332,19 +482,70 @@ def append_bibtex(bib_path, bibtex):
 PROVIDERS = {
     "scholar": ("Google Scholar", fetch_results_scholar, fetch_bibtex_scholar),
     "libris": ("Libris", fetch_results_libris, fetch_bibtex_libris),
+    "crossref": ("Crossref", fetch_results_crossref, fetch_bibtex_crossref),
 }
+
+# Display order for the interactive provider menu. Crossref and Libris are
+# listed before Google Scholar because they are more reliable (no CAPTCHAs).
+PROVIDER_ORDER = ["crossref", "libris", "scholar"]
+
+
+def prompt_provider():
+    """Interactively ask the user to choose a provider; return its key."""
+    print("\nSelect a search provider:\n")
+    for i, key in enumerate(PROVIDER_ORDER, start=1):
+        label = PROVIDERS[key][0]
+        print(f"  [{i}] {label}")
+    print(f"  [0] Abort")
+    while True:
+        try:
+            choice = input("\nProvider (0 to abort): ").strip()
+        except EOFError:
+            print("\nAborted.")
+            sys.exit(0)
+        if choice == "":
+            continue
+        try:
+            idx = int(choice)
+        except ValueError:
+            print("Please enter a number.")
+            continue
+        if idx == 0:
+            print("Aborted.")
+            sys.exit(0)
+        if 1 <= idx <= len(PROVIDER_ORDER):
+            return PROVIDER_ORDER[idx - 1]
+        print(f"Enter a number between 0 and {len(PROVIDER_ORDER)}.")
+
+
+def prompt_query():
+    """Interactively ask the user for a search query; return a non-empty str."""
+    while True:
+        try:
+            query = input("\nEnter search query: ").strip()
+        except EOFError:
+            print("\nAborted.")
+            sys.exit(0)
+        if query:
+            return query
+        print("Query cannot be empty.")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Search Google Scholar or Libris (libris.kb.se) and append "
-        "a selected result's BibTeX entry to a .bib file."
+        description="Search Google Scholar, Libris (libris.kb.se), or Crossref "
+        "and append a selected result's BibTeX entry to a .bib file."
     )
-    parser.add_argument("query", help="Search term for the selected provider.")
     parser.add_argument(
-        "--provider", choices=sorted(PROVIDERS), default="libris",
-        help="Search provider to use (default: libris). "
-        "'libris' searches libris.kb.se (books); 'scholar' searches Google Scholar.",
+        "query", nargs="?", default=None,
+        help="Search term for the selected provider. "
+        "If omitted, the script prompts interactively.",
+    )
+    parser.add_argument(
+        "--provider", choices=sorted(PROVIDERS), default=None,
+        help="Search provider to use. 'crossref' queries the Crossref REST API; "
+        "'libris' searches libris.kb.se (books); 'scholar' searches Google Scholar. "
+        "If omitted, the script prompts interactively.",
     )
     parser.add_argument(
         "--bib", default="refs.bib", help="Path to the .bib file (default: refs.bib)."
@@ -358,10 +559,20 @@ def main():
     )
     args = parser.parse_args()
 
-    provider_label, fetch_results, fetch_bibtex = PROVIDERS[args.provider]
+    if args.provider is None:
+        provider_key = prompt_provider()
+    else:
+        provider_key = args.provider
 
-    print(f"Searching {provider_label} for: {args.query!r}")
-    results = fetch_results(args.query, limit=args.limit)
+    if args.query is None:
+        query = prompt_query()
+    else:
+        query = args.query
+
+    provider_label, fetch_results, fetch_bibtex = PROVIDERS[provider_key]
+
+    print(f"\nSearching {provider_label} for: {query!r}")
+    results = fetch_results(query, limit=args.limit)
 
     if not results:
         print("No results found.")
