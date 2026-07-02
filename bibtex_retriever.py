@@ -349,7 +349,7 @@ def fetch_results_crossref(query, limit=SCHOLAR_RESULTS_LIMIT):
         bib = {
             "title": title,
             "author": _crossref_authors(item),
-            "pub_year": _crossref_year(item) or "?",
+            "year": _crossref_year(item) or "?",
             "publisher": item.get("publisher", ""),
             "type": item.get("type", ""),
             "doi": item.get("DOI", ""),
@@ -368,7 +368,7 @@ def _build_crossref_bibtex(pub):
     bib = pub.get("bib", {})
     title = bib.get("title", "")
     author = bib.get("author", "")
-    year = bib.get("pub_year", "")
+    year = bib.get("year", "")
     publisher = bib.get("publisher", "")
     doi = bib.get("doi", "")
     wtype = (bib.get("type") or "").lower()
@@ -444,7 +444,7 @@ def display_menu(results, provider_label):
         bib = pub.get("bib", {})
         title = bib.get("title") or "(no title)"
         author = bib.get("author") or "(no author)"
-        year = bib.get("pub_year") or "?"
+        year = _bib_get(bib, "year", "pub_year") or "?"
         venue = _bib_get(bib, "venue", "journal", "book", "pub")
         publisher = _bib_get(bib, "publisher")
         wtype = _bib_get(bib, "type", "entry_type", "bib_type")
@@ -511,7 +511,8 @@ def extract_year(bibtex, pub):
     m = re.search(r"year\s*=\s*[\{\"]?(\d{4})", bibtex, re.IGNORECASE)
     if m:
         return m.group(1)
-    year = pub.get("bib", {}).get("pub_year")
+    bib = pub.get("bib", {})
+    year = bib.get("year") or bib.get("pub_year")
     return year if year else None
 
 
@@ -523,6 +524,26 @@ def replace_key(bibtex, old_key, new_key):
         bibtex,
         count=1,
     )
+
+
+_PUB_YEAR_FIELD = re.compile(
+    r'\bpub_year(\s*=\s*(?:\{[^{}]*\}|"[^"]*")\s*,?)',
+    re.IGNORECASE,
+)
+
+
+def normalize_year_field(bibtex):
+    """Ensure the entry encodes its year under the standard 'year' tag.
+
+    Some provider BibTeX endpoints emit 'pub_year' instead of 'year'. If a
+    'year' field is already present, any 'pub_year' field is dropped;
+    otherwise 'pub_year' is renamed to 'year'. Applied to every fetched
+    entry so the .bib file always uses 'year' regardless of provider.
+    """
+    has_year = re.search(r"\byear\s*=", bibtex, re.IGNORECASE) is not None
+    if has_year:
+        return _PUB_YEAR_FIELD.sub("", bibtex)
+    return _PUB_YEAR_FIELD.sub(r"year\1", bibtex)
 
 
 def derive_key(bibtex, pub, override):
@@ -592,10 +613,10 @@ def prompt_provider():
     for i, key in enumerate(PROVIDER_ORDER, start=1):
         label = PROVIDERS[key][0]
         print(f"  [{i}] {label}")
-    print(f"  [0] Abort")
+    print(f"  [0] Exit")
     while True:
         try:
-            choice = input("\nProvider (0 to abort): ").strip()
+            choice = input("\nProvider (0 to exit): ").strip()
         except EOFError:
             print("\nAborted.")
             sys.exit(0)
@@ -607,7 +628,7 @@ def prompt_provider():
             print("Please enter a number.")
             continue
         if idx == 0:
-            print("Aborted.")
+            print("Exit.")
             sys.exit(0)
         if 1 <= idx <= len(PROVIDER_ORDER):
             return PROVIDER_ORDER[idx - 1]
@@ -655,57 +676,64 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.provider is None:
-        provider_key = prompt_provider()
-    else:
-        provider_key = args.provider
+    # CLI-supplied provider/query/key apply only to the first iteration; after
+    # each completed action the loop returns to the provider prompt instead of
+    # exiting, so subsequent iterations are fully interactive.
+    cli_provider = args.provider
+    cli_query = args.query
+    cli_key = args.key
 
-    if args.query is None:
-        query = prompt_query()
-    else:
-        query = args.query
+    while True:
+        provider_key = cli_provider if cli_provider is not None else prompt_provider()
+        query = cli_query if cli_query is not None else prompt_query()
+        override = cli_key
+        cli_provider = None
+        cli_query = None
+        cli_key = None
 
-    provider_label, fetch_results, fetch_bibtex = PROVIDERS[provider_key]
+        provider_label, fetch_results, fetch_bibtex = PROVIDERS[provider_key]
 
-    print(f"\nSearching {provider_label} for: {query!r}")
-    results = fetch_results(query, limit=args.limit)
+        print(f"\nSearching {provider_label} for: {query!r}")
+        results = fetch_results(query, limit=args.limit)
 
-    if not results:
-        print("No results found.")
-        return
+        if not results:
+            print("No results found.")
+            continue
 
-    display_menu(results, provider_label)
-    choice = prompt_selection(len(results))
-    if choice == 0:
-        print("Aborted.")
-        return
+        display_menu(results, provider_label)
+        choice = prompt_selection(len(results))
+        if choice == 0:
+            print("Aborted.")
+            continue
 
-    selected = results[choice - 1]
-    bibtex = fetch_bibtex(selected)
-    if not bibtex:
-        return
+        selected = results[choice - 1]
+        bibtex = fetch_bibtex(selected)
+        if not bibtex:
+            continue
 
-    # Find the original key in the fetched BibTeX
-    m = re.match(r"@\w+\s*\{\s*([^,\s]+)\s*,", bibtex)
-    original_key = m.group(1) if m else None
+        bibtex = normalize_year_field(bibtex)
 
-    new_key = derive_key(bibtex, selected, args.key)
-    if new_key is None:
-        # Fall back to the provider's original key
-        new_key = original_key or "entry"
-        print(
-            f"Warning: could not derive firstAuthor+year key; "
-            f"using the provider's key '{new_key}'",
-            file=sys.stderr,
-        )
+        # Find the original key in the fetched BibTeX
+        m = re.match(r"@\w+\s*\{\s*([^,\s]+)\s*,", bibtex)
+        original_key = m.group(1) if m else None
 
-    new_key = deduplicate_key(new_key, args.bib)
+        new_key = derive_key(bibtex, selected, override)
+        if new_key is None:
+            # Fall back to the provider's original key
+            new_key = original_key or "entry"
+            print(
+                f"Warning: could not derive firstAuthor+year key; "
+                f"using the provider's key '{new_key}'",
+                file=sys.stderr,
+            )
 
-    if original_key and original_key != new_key:
-        bibtex = replace_key(bibtex, original_key, new_key)
+        new_key = deduplicate_key(new_key, args.bib)
 
-    append_bibtex(args.bib, bibtex)
-    print(f"\nAppended entry with cite key '{new_key}' to {args.bib}")
+        if original_key and original_key != new_key:
+            bibtex = replace_key(bibtex, original_key, new_key)
+
+        append_bibtex(args.bib, bibtex)
+        print(f"\nAppended entry with cite key '{new_key}' to {args.bib}")
 
 
 if __name__ == "__main__":
