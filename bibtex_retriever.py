@@ -77,6 +77,11 @@ def fetch_results_libris(query, limit=SCHOLAR_RESULTS_LIMIT):
     Scholar path so the rest of the pipeline (display, key derivation, etc.)
     can treat both providers uniformly. A ``"libris_identifier"`` field carries
     the record URI used later to fetch the BibTeX entry.
+
+    xsearch only exposes a single creator and may return repeated/list-valued
+    dates, so for each result the full BibTeX is also fetched up front: it
+    yields the complete author list and a clean year for display, and is cached
+    in ``"libris_bibtex"`` so selecting the entry need not re-fetch it.
     """
     params = urllib.parse.urlencode({"query": query, "n": limit, "format": "json"})
     body = _libris_request(f"{LIBRIS_XSEARCH_URL}?{params}")
@@ -99,12 +104,22 @@ def fetch_results_libris(query, limit=SCHOLAR_RESULTS_LIMIT):
         bib = {
             "title": item.get("title", "(no title)"),
             "author": _clean_libris_creator(item.get("creator", "")) or "(no author)",
-            "pub_year": item.get("date") or "?",
-            "publisher": item.get("publisher", ""),
-            "isbn": item.get("isbn", ""),
+            "pub_year": _libris_normalize_year(item.get("date")) or "?",
+            "publisher": _libris_join_list(item.get("publisher", "")),
+            "isbn": _libris_join_list(item.get("isbn", "")),
             "type": item.get("type", ""),
         }
-        results.append({"bib": bib, "libris_identifier": identifier})
+        entry = {"bib": bib, "libris_identifier": identifier}
+        bibtex = _libris_cite_bibtex(identifier)
+        if bibtex:
+            authors = _extract_bibtex_field(bibtex, "author")
+            if authors:
+                bib["author"] = authors
+            year = _extract_bibtex_field(bibtex, "year")
+            if year:
+                bib["pub_year"] = year
+            entry["libris_bibtex"] = bibtex
+        results.append(entry)
     return results
 
 
@@ -118,8 +133,52 @@ def _clean_libris_creator(creator):
     if not creator:
         return ""
     parts = [p.strip() for p in creator.split(",")]
-    parts = [p for p in parts if not re.fullmatch(r"\d{4}(-\d{4})?", p)]
+    parts = [p for p in parts if not re.fullmatch(r"\d{4}(?:-\d{4})?-?", p)]
     return ", ".join(parts)
+
+
+def _libris_join_list(value):
+    """Flatten a Libris field that may be a str or list into a clean string.
+
+    Libris xsearch returns some fields (publisher, isbn, date) as JSON arrays
+    when a record has multiple values. Render them as '; '-joined strings so
+    they display and feed BibTeX fields cleanly instead of as Python reprs.
+    """
+    if isinstance(value, list):
+        return "; ".join(p for p in (str(p).strip() for p in value) if p)
+    return str(value).strip() if value else ""
+
+
+def _libris_normalize_year(date):
+    """Reduce a Libris 'date' value (str or list) to a single year string.
+
+    xsearch may return a list such as ``['[2025]', '2025', '2025']``; pick the
+    first 4-digit year found so the year is shown once. Falls back to the raw
+    value (e.g. 'nnnn') when no 4-digit year is present.
+    """
+    if not date:
+        return ""
+    candidates = date if isinstance(date, list) else [date]
+    for cand in candidates:
+        if not cand:
+            continue
+        m = re.search(r"\d{4}", str(cand))
+        if m:
+            return m.group(0)
+    for cand in candidates:
+        if cand:
+            return str(cand)
+    return ""
+
+
+def _extract_bibtex_field(bibtex, field):
+    """Return the value of a named BibTeX field, or None."""
+    m = re.search(
+        rf"\b{field}\s*=\s*[\{{\"]\s*(.+?)\s*[\}}\"]",
+        bibtex,
+        re.IGNORECASE,
+    )
+    return m.group(1) if m else None
 
 
 def _build_libris_bibtex(pub):
@@ -182,28 +241,43 @@ def _libris_resolve_identifier(identifier):
     return identifier
 
 
+def _libris_cite_bibtex(identifier):
+    """Fetch BibTeX from the Libris unAPI cite endpoint, or None on failure.
+
+    Resolves legacy numeric bib identifiers to their modern IRIs first.
+    """
+    resolved = _libris_resolve_identifier(identifier)
+    if not resolved:
+        return None
+    params = urllib.parse.urlencode({"id": resolved, "format": "bibtex"})
+    req = urllib.request.Request(
+        f"{LIBRIS_CITE_URL}?{params}", headers={"User-Agent": LIBRIS_USER_AGENT}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=LIBRIS_REQUEST_TIMEOUT) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        print(
+            f"Libris cite endpoint unavailable for {resolved}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
 def fetch_bibtex_libris(pub):
     """Return the raw BibTeX string for a Libris record, or None.
 
-    Tries the unAPI cite endpoint first (resolving legacy numeric bib
-    identifiers to their modern IRIs); on failure falls back to building an
+    Reuses BibTeX already fetched while building the search menu when present;
+    otherwise queries the unAPI cite endpoint (resolving legacy numeric bib
+    identifiers to their modern IRIs). On failure falls back to building an
     entry from the search-result metadata so the user is never left empty.
     """
-    identifier = pub.get("libris_identifier", "")
-    resolved = _libris_resolve_identifier(identifier)
-    if resolved:
-        params = urllib.parse.urlencode({"id": resolved, "format": "bibtex"})
-        req = urllib.request.Request(
-            f"{LIBRIS_CITE_URL}?{params}", headers={"User-Agent": LIBRIS_USER_AGENT}
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=LIBRIS_REQUEST_TIMEOUT) as resp:
-                return resp.read().decode("utf-8", errors="replace")
-        except Exception as exc:
-            print(
-                f"Libris cite endpoint unavailable for {resolved}: {exc}",
-                file=sys.stderr,
-            )
+    cached = pub.get("libris_bibtex")
+    if cached:
+        return cached
+    bibtex = _libris_cite_bibtex(pub.get("libris_identifier", ""))
+    if bibtex:
+        return bibtex
     print("Falling back to building a BibTeX entry from Libris metadata.",
           file=sys.stderr)
     return _build_libris_bibtex(pub)
@@ -354,16 +428,38 @@ def fetch_bibtex_crossref(pub):
     return _build_crossref_bibtex(pub)
 
 
+def _bib_get(bib, *names):
+    """Return the first non-empty value from ``bib`` among the given keys."""
+    for name in names:
+        value = bib.get(name)
+        if value:
+            return value
+    return ""
+
+
 def display_menu(results, provider_label):
-    """Print the numbered menu of search results."""
+    """Print the numbered menu of search results with bibliographic details."""
     print(f"\n{provider_label} results:\n")
     for i, pub in enumerate(results, start=1):
         bib = pub.get("bib", {})
-        title = bib.get("title", "(no title)")
-        author = bib.get("author", "(no author)")
-        year = bib.get("pub_year", "?")
+        title = bib.get("title") or "(no title)"
+        author = bib.get("author") or "(no author)"
+        year = bib.get("pub_year") or "?"
+        venue = _bib_get(bib, "venue", "journal", "book", "pub")
+        publisher = _bib_get(bib, "publisher")
+        wtype = _bib_get(bib, "type", "entry_type", "bib_type")
+        identifier = _bib_get(bib, "doi", "isbn", "url", "eprint_url")
+
         print(f"  [{i}] {title}")
         print(f"      {author} ({year})")
+        if wtype:
+            print(f"      type: {wtype}")
+        if venue:
+            print(f"      venue: {venue}")
+        if publisher:
+            print(f"      publisher: {publisher}")
+        if identifier:
+            print(f"      id: {identifier}")
     print(f"  [0] Abort")
 
 
