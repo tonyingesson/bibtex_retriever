@@ -10,3 +10,5 @@ Use:
 python bibtex_retriever.py --bib [bib file]
 
 The script will ask you to select a provider, then to enter a search query. Select the appropriate search result, it will be appended to the selected bib file in Bibtex compatible format.
+
+Code by GLM-5
