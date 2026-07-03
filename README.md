@@ -3,7 +3,7 @@ A script for pulling Bibtex data from different providers. Current list of suppo
 - Google Scholar
 - Libris
 
-Google Scholar will tend to have a prohibitive rate limit. Libris is more reliable but works only for books in the Libris database (libris.kb.se). Crossref works for articles, has a relatively generous rate limit.
+Google Scholar will tend to have a prohibitive rate limit. Libris is more reliable but works only for books in the Libris database (libris.kb.se). Crossref works for articles and book chapters, has a relatively generous rate limit.
 
 Use:
 
