@@ -9,7 +9,7 @@ Use:
 
 python bibtex_retriever.py --bib [bib file]
 
-The script will ask you to select a provider, then to enter a search query. Select the appropriate search result, it will be appended to the selected bib file in Bibtex compatible format. The script runs in a loop to allow new search queries until terminated by a key press specified in the output.
+The script will ask you to select a provider, then to enter a search query. Select the appropriate search result, it will be appended to the selected bib file in Bibtex compatible format. The script runs in a loop (returning to the search provider selection screen) to allow new search queries until terminated by a key press specified in the output.
 
 For Google Scholar queries, scholarly is required (see requirements.txt)
 
